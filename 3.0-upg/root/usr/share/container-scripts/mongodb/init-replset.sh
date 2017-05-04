@@ -6,7 +6,23 @@ set -o pipefail
 
 source "${CONTAINER_SCRIPTS_PATH}/common.sh"
 
+# This is a full hostname that will be added to replica set
+# (for example, "replica-2.mongodb.myproject.svc.cluster.local")
+readonly MEMBER_HOST="$(container_addr)"
+
+# Initializes the replica set configuration.
+#
+# Arguments:
+# - $1: host address[:port]
+#
+# Uses the following global variables:
+# - MONGODB_REPLICA_NAME
+# - MONGODB_ADMIN_PASSWORD
+# - MONGODB_INITIAL_REPLICA_COUNT
 function initiate() {
+  local host="$1"
+
+  # Wait for all nodes to be listed in endpoints() and accept connections
   current_endpoints=$(endpoints)
   if [ -n "${MONGODB_INITIAL_REPLICA_COUNT:-}" ]; then
     echo -n "=> Waiting for $MONGODB_INITIAL_REPLICA_COUNT MongoDB endpoints ..."
@@ -26,64 +42,73 @@ function initiate() {
     done
   fi
   echo "${current_endpoints}"
-
-  # Let initialize the first member of the cluster
-  mongo_node="$(echo -n ${current_endpoints} | cut -d ' ' -f 1):${CONTAINER_PORT}"
-
   echo "=> Waiting for all endpoints to accept connections..."
   for node in ${current_endpoints}; do
     wait_for_mongo_up ${node} &>/dev/null
   done
 
-  echo "=> Waiting for local MongoDB to accept connections ..."
-  wait_for_mongo_up &>/dev/null
+  local config="{_id: '${MONGODB_REPLICA_NAME}', $(replset_config_members "${current_endpoints}")}"
 
-  echo "=> Initiating the replSet ${MONGODB_REPLICA_NAME} ..."
-  # This will perform the 'rs.initiate()' command on the current MongoDB.
-  mongo_initiate "${current_endpoints}"
+  info "Initiating MongoDB replica using: ${config}"
+  mongo --eval "quit(rs.initiate(${config}).ok ? 0 : 1)" --quiet
 
-  echo "=> Creating MongoDB users ..."
+  info "Waiting for PRIMARY status ..."
+  mongo --eval "while (!rs.isMaster().ismaster) { sleep(100); }" --quiet
+
+  info "Creating MongoDB users ..."
   mongo_create_admin
   mongo_create_user "-u admin -p ${MONGODB_ADMIN_PASSWORD}"
 
-  echo "=> Waiting for replication to finish ..."
-  # TODO: Replace this with polling or a Mongo script that will check if all
-  #       members of the cluster are now properly replicated (user accounts are
-  #       created on all members).
-  sleep 10
-
-  # Some commands will force MongoDB client to re-connect. This is not working
-  # well in combination with '--eval'. In that case the 'mongo' command will fail
-  # with return code 254.
-  echo "=> Initiate Pod giving up the PRIMARY role ..."
-  mongo admin -u admin -p "${MONGODB_ADMIN_PASSWORD}" --quiet --eval "rs.stepDown(120);" &>/dev/null || true
-
-  # Wait till the new PRIMARY member is elected
-  echo "=> Waiting for the new PRIMARY to be elected ..."
-  mongo admin -u admin -p "${MONGODB_ADMIN_PASSWORD}" --quiet --host ${mongo_node} --eval "var done=false;while(done==false){var members=rs.status().members;for(i=0;i<members.length;i++){if(members[i].stateStr=='PRIMARY' && members[i].name!='$(mongo_addr)'){done=true}};sleep(500)};" &>/dev/null
-
-  # Remove the initialization container MongoDB from cluster and shutdown
-  echo "=> A new PRIMARY member was elected, shutting down local mongod ..."
-  mongo_remove
-
-  mongod -f ${MONGODB_CONFIG_PATH} --shutdown &>/dev/null
-  wait_for_mongo_down
-
-  echo "=> Successfully initialized replica set"
+  info "Successfully initialized replica set"
 }
 
+# Adds a host to the replica set configuration.
+#
+# Arguments:
+# - $1: host address[:port]
+#
+# Global variables:
+# - MONGODB_ADMIN_PASSWORD
 function add_member() {
-  echo "=> Waiting for local MongoDB to accept connections ..."
-  wait_for_mongo_up
-  set -x
-  # Add the current container to the replica set.
-  mongo_add
+  local host="$1"
+  info "Adding ${host} to replica set ..."
+
+  if [ -z "$(endpoints)" ]; then
+    info "ERROR: couldn't add host to replica set!"
+    info "CAUSE: DNS lookup for '${MONGODB_SERVICE_NAME:-mongodb}' returned no results."
+    return 1
+  fi
+
+  local replset_addr
+  replset_addr="$(replset_addr)"
+
+  if ! mongo admin -u admin -p "${MONGODB_ADMIN_PASSWORD}" --host "${replset_addr}" --eval "while (!rs.add('${host}').ok) { sleep(100); }" --quiet; then
+    info "ERROR: couldn't add host to replica set!"
+    return 1
+  fi
+
+  info "Waiting for PRIMARY/SECONDARY status ..."
+  mongo --eval "while (!rs.isMaster().ismaster && !rs.isMaster().secondary) { sleep(100); }" --quiet
+
+  info "Successfully joined replica set"
 }
 
-if [[ "$1" == "initiate" ]]; then
+info "Waiting for local MongoDB to accept connections ..."
+wait_for_mongo_up &>/dev/null
+
+if [[ $(mongo --eval 'db.isMaster().setName' --quiet) == "${MONGODB_REPLICA_NAME}" ]]; then
+  info "Replica set '${MONGODB_REPLICA_NAME}' already exists, skipping initialization"
+  exit 0
+fi
+
+# Initialize replica set only if we're the first member
+if [ "$1" == "initiate" ]; then
+  main_process_id=$2
   # Initiate replica set
-  initiate
+  initiate "${MEMBER_HOST}"
+
+  # Exit this pod
+  kill ${main_process_id}
 else
-  # Try to add the current host into the replica set
-  add_member
+  add_member "${MEMBER_HOST}"
 fi
